@@ -20,10 +20,10 @@ The image is built for `linux/amd64` and `linux/arm64` on Alpine Linux. CI build
 | --- | --- |
 | `latest` | The newest build. |
 | `<postfix version>` (for example `3.11.8`) | The newest build of that Postfix release. |
-| `<postfix version>-<YYYYMMDD>` | One build, never moved. Pin this tag, or a digest, in production. |
+| `<postfix version>-<YYYYMMDD>.<run>` (for example `3.11.8-20261127.4`) | One build, never moved: `<run>` is the number of the CI run that built it, and a re-run of that run adds `-<attempt>`. Pin this tag, or a digest, in production. |
 | `latest-amd64`, `latest-arm64` | The newest build for a single architecture. |
 
-Postfix's own release numbers the tags. The image carries no version of its own, so the tags have no semantic version.
+Postfix's own release numbers the tags. The image carries no version of its own, so the tags have no semantic version. The commit an image was built from is in its `org.opencontainers.image.revision` label and in its build provenance attestation.
 
 ### Verifying an image
 
