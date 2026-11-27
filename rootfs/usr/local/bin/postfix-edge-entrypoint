@@ -1,0 +1,151 @@
+#!/bin/sh
+# Renders Postfix's main.cf from the environment and the main.cf.d overrides,
+# then runs Postfix in the foreground, or runs the given command instead.
+set -eu
+
+CONF_DIR=/etc/postfix-edge
+DIST_MAIN_CF="${CONF_DIR}/main.cf.dist"
+DEFAULTS="${CONF_DIR}/main.cf.defaults"
+OVERRIDE_DIR="${CONF_DIR}/main.cf.d"
+NL='
+'
+
+die() {
+  printf 'postfix-edge: %s\n' "$*" >&2
+  exit 64
+}
+
+info() {
+  printf 'postfix-edge: %s\n' "$*" >&2
+}
+
+# A value reaches main.cf through postconf, so a newline could add a parameter.
+single_line() {
+  case "$2" in
+    *"$NL"*) die "$1 must be a single line" ;;
+  esac
+}
+
+valid_domain() {
+  case "$1" in
+    '' | .* | *. | -* | *..* | *[!A-Za-z0-9.-]*) return 1 ;;
+    *.*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+domains_raw="${POSTFIX_EDGE_DOMAINS:-}"
+single_line POSTFIX_EDGE_DOMAINS "$domains_raw"
+[ -n "$domains_raw" ] ||
+  die "POSTFIX_EDGE_DOMAINS is required: the domains to accept mail for, separated by commas or spaces"
+domains=""
+first_domain=""
+set -f
+for d in $(printf '%s' "$domains_raw" | tr ',' ' '); do
+  valid_domain "$d" || die "POSTFIX_EDGE_DOMAINS: '$d' is not a domain name"
+  domains="${domains:+${domains}, }${d}"
+  first_domain="${first_domain:-$d}"
+done
+set +f
+[ -n "$domains" ] || die "POSTFIX_EDGE_DOMAINS names no domain"
+
+hostname_value="${POSTFIX_EDGE_HOSTNAME:-mail.${first_domain}}"
+single_line POSTFIX_EDGE_HOSTNAME "$hostname_value"
+valid_domain "$hostname_value" || die "POSTFIX_EDGE_HOSTNAME: '$hostname_value' is not a fully qualified host name"
+
+# In the bracket classes below "]" comes first and unescaped: busybox ash
+# does not read an escaped "\]" inside a class.
+lmtp="${POSTFIX_EDGE_LMTP:-inet:127.0.0.1:24}"
+single_line POSTFIX_EDGE_LMTP "$lmtp"
+case "$lmtp" in
+  *[!]A-Za-z0-9.:/_[-]*) die "POSTFIX_EDGE_LMTP: '$lmtp' holds a character that is not allowed" ;;
+  inet:?*:?* | unix:/?*) ;;
+  *) die "POSTFIX_EDGE_LMTP: '$lmtp' is not inet:<host>:<port> or unix:<path>" ;;
+esac
+
+mynetworks="${POSTFIX_EDGE_MYNETWORKS:-127.0.0.0/8}"
+single_line POSTFIX_EDGE_MYNETWORKS "$mynetworks"
+case "$mynetworks" in
+  '' | *[!]0-9A-Fa-f.:/[,\ ]*) die "POSTFIX_EDGE_MYNETWORKS: '$mynetworks' is not a list of networks" ;;
+esac
+
+tls_mode="${POSTFIX_EDGE_TLS:-may}"
+tls_cert="${POSTFIX_EDGE_TLS_CERT:-${CONF_DIR}/tls/tls.crt}"
+tls_key="${POSTFIX_EDGE_TLS_KEY:-${CONF_DIR}/tls/tls.key}"
+single_line POSTFIX_EDGE_TLS_CERT "$tls_cert"
+single_line POSTFIX_EDGE_TLS_KEY "$tls_key"
+case "$tls_mode" in
+  may | encrypt)
+    for f in "$tls_key" "$tls_cert"; do
+      case "$f" in
+        /*) ;;
+        *) die "TLS file '$f' is not an absolute path" ;;
+      esac
+      case "$f" in
+        *,* | *' '*) die "TLS file '$f' must not contain a comma or a space" ;;
+      esac
+      [ -r "$f" ] || die "TLS file '$f' is missing or unreadable; mount the certificate and key, or set POSTFIX_EDGE_TLS=none"
+    done
+    ;;
+  none) info "POSTFIX_EDGE_TLS=none: STARTTLS is not offered" ;;
+  *) die "POSTFIX_EDGE_TLS must be 'may', 'encrypt', or 'none', not '$tls_mode'" ;;
+esac
+
+verify="${POSTFIX_EDGE_VERIFY_RECIPIENTS:-yes}"
+case "$verify" in
+  yes) recipient_restrictions="reject_non_fqdn_recipient, reject_unverified_recipient" ;;
+  no) recipient_restrictions="reject_non_fqdn_recipient" ;;
+  *) die "POSTFIX_EDGE_VERIFY_RECIPIENTS must be 'yes' or 'no', not '$verify'" ;;
+esac
+
+# Start each run from the packaged main.cf, so a removed override does not linger.
+cp "$DIST_MAIN_CF" /etc/postfix/main.cf
+
+params_file="$(mktemp)"
+trap 'rm -f "$params_file"' EXIT
+{
+  cat "$DEFAULTS"
+  printf '%s\n' \
+    "myhostname = ${hostname_value}" \
+    "mydomain = ${first_domain}" \
+    "relay_domains = ${domains}" \
+    "relay_transport = lmtp:${lmtp}" \
+    "mynetworks = ${mynetworks}" \
+    "smtpd_recipient_restrictions = ${recipient_restrictions}"
+  if [ "$tls_mode" = none ]; then
+    printf '%s\n' "smtpd_tls_security_level = none"
+  else
+    printf '%s\n' \
+      "smtpd_tls_security_level = ${tls_mode}" \
+      "smtpd_tls_chain_files = ${tls_key}, ${tls_cert}"
+  fi
+  for f in "$OVERRIDE_DIR"/*.cf; do
+    [ -e "$f" ] || continue
+    info "applying overrides from $f"
+    cat "$f"
+    printf '\n'
+  done
+} >"$params_file"
+
+# A function keeps the container's own arguments in the outer "$@".
+apply_params() {
+  set --
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      '' | '#'*) ;;
+      [A-Za-z_]*=*) set -- "$@" "$line" ;;
+      *) die "'$line' is not a 'name = value' line" ;;
+    esac
+  done <"$params_file"
+  postconf -e -- "$@"
+}
+apply_params
+rm -f "$params_file"
+
+postfix post-install create-missing readme_directory=no
+postfix check
+
+if [ "$#" -gt 0 ]; then
+  exec "$@"
+fi
+exec postfix start-fg

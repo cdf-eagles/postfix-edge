@@ -1,0 +1,7 @@
+---
+# actionlint v1.7.12, the latest release, predates the Ubuntu 26.04 runner
+# images and rejects their labels. Remove this entry once a release knows them.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
+    - ubuntu-26.04-arm

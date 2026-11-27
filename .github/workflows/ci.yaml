@@ -1,0 +1,311 @@
+---
+name: CI
+
+# yamllint disable-line rule:truthy
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Weekly: rebuilds the image with Alpine's latest packages and surfaces new advisories.
+    - cron: '41 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  SNYK_VERSION: 1.1308.4
+  SNYK_SHA256: 979172ee128903f50e43fff221f22a0689579f22c086dabaa0d1a5416485b9ba
+  PYTHON_VERSION: "3.13.18"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install the Python tools
+        run: |
+          set -euo pipefail
+          python3 -m venv "${RUNNER_TEMP}/venv"
+          "${RUNNER_TEMP}/venv/bin/pip" install --quiet --require-virtualenv -r ci/requirements.txt
+          echo "${RUNNER_TEMP}/venv/bin" >> "${GITHUB_PATH}"
+
+      - name: Run shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -s sh scripts/*.sh rootfs/usr/local/bin/postfix-edge-entrypoint
+
+      - name: Run yamllint
+        run: |
+          yamllint --version
+          yamllint --strict .
+
+      - name: Compile the test scripts
+        run: python3 -m py_compile tests/*.py
+
+      # yamllint covers check-yaml; actionlint turns its shellcheck checks off
+      # when shellcheck is not on PATH.
+      - name: Run hadolint, actionlint, and the remaining pre-commit hooks
+        env:
+          SKIP: check-yaml
+        run: |
+          set -euo pipefail
+          command -v shellcheck
+          pre-commit --version
+          pre-commit run --all-files --show-diff-on-failure
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require an unshallow clone
+        run: test "$(git rev-parse --is-shallow-repository)" = false
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl --proto "=https" --tlsv1.2 -sSfL \
+            --retry 8 --retry-delay 30 --retry-max-time 300 --retry-all-errors \
+            -o "${RUNNER_TEMP}/${tarball}" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          echo "${GITLEAKS_SHA256}  ${RUNNER_TEMP}/${tarball}" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/${tarball}" -C "${RUNNER_TEMP}" gitleaks
+          "${RUNNER_TEMP}/gitleaks" version
+
+      - name: Run gitleaks over the history of the checked-out commit
+        run: '"${RUNNER_TEMP}/gitleaks" git --no-banner --redact --verbose --log-opts="HEAD" .'
+
+  image:
+    name: Build and test (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the image
+        env:
+          REVISION: ${{ github.sha }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          docker version --format 'docker {{.Server.Version}} {{.Server.Arch}}'
+          # Docker media types keep the HEALTHCHECK, which Podman ignores in an OCI image.
+          docker buildx build --pull --no-cache --provenance=false \
+            --output type=docker,oci-mediatypes=false \
+            --label "org.opencontainers.image.revision=${REVISION}" \
+            --label "org.opencontainers.image.source=${SOURCE}" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t postfix-edge:ci .
+          arch=$(docker image inspect -f '{{.Architecture}}' postfix-edge:ci)
+          echo "image architecture: ${arch}"
+          test "${arch}" = "${{ matrix.arch }}"
+
+      - name: Run the smoke test
+        env:
+          ENGINE: docker
+        run: sh scripts/smoke-test.sh postfix-edge:ci
+
+      - name: Save the image and its Postfix version
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          mkdir "${RUNNER_TEMP}/out"
+          docker run --rm --entrypoint postconf postfix-edge:ci -dh mail_version > "${RUNNER_TEMP}/out/version-${{ matrix.arch }}.txt"
+          cat "${RUNNER_TEMP}/out/version-${{ matrix.arch }}.txt"
+          docker save -o "${RUNNER_TEMP}/out/postfix-edge-${{ matrix.arch }}.tar" postfix-edge:ci
+
+      - name: Upload the image
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: image-${{ matrix.arch }}
+          path: ${{ runner.temp }}/out/
+          retention-days: 1
+          if-no-files-found: error
+
+  snyk:
+    name: Snyk
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # The Snyk CLI reads the dependency tree from the installed packages.
+      - name: Install the Python tools
+        run: |
+          set -euo pipefail
+          python3 -m venv "${RUNNER_TEMP}/venv"
+          "${RUNNER_TEMP}/venv/bin/pip" install --quiet --require-virtualenv -r ci/requirements.txt
+
+      - name: Install the Snyk CLI
+        run: |
+          set -euo pipefail
+          curl --proto "=https" --tlsv1.2 -sSfL \
+            --retry 8 --retry-delay 30 --retry-max-time 300 --retry-all-errors \
+            -o "${RUNNER_TEMP}/snyk" \
+            "https://github.com/snyk/cli/releases/download/v${SNYK_VERSION}/snyk-linux"
+          echo "${SNYK_SHA256}  ${RUNNER_TEMP}/snyk" | sha256sum -c -
+          chmod 755 "${RUNNER_TEMP}/snyk"
+          "${RUNNER_TEMP}/snyk" --version
+
+      # Fails on any high or critical issue in the CI tool pins, on a scan
+      # error, and when ci/requirements.txt is missing, so the required check
+      # fails closed. Dependabot pull requests read SNYK_TOKEN from the
+      # Dependabot secrets.
+      - name: Fail on high or critical dependency issues
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          SNYK_DISABLE_ANALYTICS: 1
+        run: |
+          set -euo pipefail
+          if [ -z "${SNYK_TOKEN}" ]; then
+            echo "::error::SNYK_TOKEN is not set for this run"
+            exit 1
+          fi
+          "${RUNNER_TEMP}/snyk" test --file=ci/requirements.txt --package-manager=pip \
+            --command="${RUNNER_TEMP}/venv/bin/python" --severity-threshold=high
+
+  # Pushes both architectures, joins them under each tag as one multi-architecture
+  # index, and attests that index. Never runs for a pull request.
+  publish:
+    name: Publish
+    needs: [lint, secrets, image, snyk]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - name: Download the images
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: image-*
+          path: ${{ runner.temp }}/images
+          merge-multiple: true
+
+      - name: Log in to the GitHub Container Registry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "${GH_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Push each architecture and create the tagged index
+        id: push
+        run: |
+          set -euo pipefail
+          amd64_version=$(cat "${RUNNER_TEMP}/images/version-amd64.txt")
+          arm64_version=$(cat "${RUNNER_TEMP}/images/version-arm64.txt")
+          if [ "${amd64_version}" != "${arm64_version}" ]; then
+            echo "::error::the architectures carry different Postfix versions: ${amd64_version} and ${arm64_version}"
+            exit 1
+          fi
+          version="${amd64_version}"
+          if ! printf '%s\n' "${version}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::'${version}' is not a Postfix version"
+            exit 1
+          fi
+          refs=""
+          for arch in amd64 arm64; do
+            docker load -i "${RUNNER_TEMP}/images/postfix-edge-${arch}.tar"
+            test "$(docker image inspect -f '{{.Architecture}}' postfix-edge:ci)" = "${arch}"
+            docker tag postfix-edge:ci "${IMAGE}:latest-${arch}"
+            docker push --quiet "${IMAGE}:latest-${arch}"
+            # The registry's digest: RepoDigests can list a local name first.
+            digest=$(docker buildx imagetools inspect "${IMAGE}:latest-${arch}" --format '{{json .Manifest}}' | jq -r .digest)
+            case "${digest}" in
+              sha256:*) ;;
+              *) echo "::error::no registry digest for ${arch}: '${digest}'"; exit 1 ;;
+            esac
+            echo "${arch}: ${IMAGE}@${digest}"
+            refs="${refs} ${IMAGE}@${digest}"
+            docker image rm postfix-edge:ci "${IMAGE}:latest-${arch}" >/dev/null
+          done
+          stamp=$(date -u +%Y%m%d)
+          # shellcheck disable=SC2086 # refs is a list of image references.
+          docker buildx imagetools create \
+            -t "${IMAGE}:latest" -t "${IMAGE}:${version}" -t "${IMAGE}:${version}-${stamp}" ${refs}
+          index=$(docker buildx imagetools inspect "${IMAGE}:${version}-${stamp}" --format '{{json .Manifest}}' | jq -r .digest)
+          case "${index}" in
+            sha256:*) ;;
+            *) echo "::error::could not read the index digest"; exit 1 ;;
+          esac
+          echo "digest=${index}" >> "${GITHUB_OUTPUT}"
+          echo "tags: latest ${version} ${version}-${stamp}; index ${index}"
+
+      - name: Attest the build provenance of the index
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify the attestation and both architectures
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo "${GITHUB_REPOSITORY}"
+          media=$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --raw | jq -r .mediaType)
+          echo "index media type: ${media}"
+          test "${media}" = "application/vnd.docker.distribution.manifest.list.v2+json"
+          platforms=$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .Manifest}}' |
+            jq -r '[.manifests[] | select(.platform.os == "linux") | .platform.architecture] | sort | join(" ")')
+          echo "platforms: ${platforms}"
+          test "${platforms}" = "amd64 arm64"
+
+  tool-drift:
+    name: Tool drift
+    if: github.event_name == 'schedule'
+    permissions:
+      contents: read
+      issues: write
+    uses: cdf-eagles/.github/.github/workflows/tool-drift.yaml@a3ceea039aa09885488009ee39ac07d9e7cfdefe  # v1.1.1

@@ -1,0 +1,6 @@
+# Python bytecode from py_compile and local test runs
+__pycache__/
+*.pyc
+
+# macOS Finder metadata
+.DS_Store

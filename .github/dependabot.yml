@@ -1,0 +1,38 @@
+---
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # The image's Alpine base; a new digest rebuilds the image on merge.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+
+  # The smoke test's helper image.
+  - package-ecosystem: docker
+    directory: /tests
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: pip
+    directory: /ci
+    schedule:
+      interval: weekly
+    groups:
+      ci-python-tools:
+        patterns: ["*"]
+
+  - package-ecosystem: pre-commit
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      pre-commit-hooks:
+        patterns: ["*"]
